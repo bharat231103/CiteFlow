@@ -39,6 +39,7 @@ from utils.qdrant_ops import (
     search_qdrant,
     ensure_collection,
 )
+from utils.citation_metadata import enrich_citations
 
 logger = logging.getLogger("citeflow.agent")
 
@@ -342,8 +343,8 @@ def get_fast_agent():
     return _fast_agent
 
 
-def _parse_agent_response(result: dict) -> dict:
-    """Extract suggestion + citations JSON from agent's final message."""
+def _parse_agent_raw_response(result: dict) -> dict:
+    """Extract suggestion + raw URL citations from agent's final message."""
     final_message = result["messages"][-1]
 
     if isinstance(final_message, AIMessage):
@@ -358,13 +359,33 @@ def _parse_agent_response(result: dict) -> dict:
                 if suggestion:
                     if not citations:
                         logger.warning("Agent returned suggestion without citations!")
-                    return {"suggestion": suggestion, "citations": citations}
+                    return {"suggestion": suggestion, "raw_urls": citations}
         except json.JSONDecodeError:
             logger.warning("Could not parse agent response as JSON")
 
-        return {"suggestion": response_text, "citations": []}
+        return {"suggestion": response_text, "raw_urls": []}
 
-    return {"suggestion": "Unable to generate a suggestion at this time.", "citations": []}
+    return {"suggestion": "Unable to generate a suggestion at this time.", "raw_urls": []}
+
+
+async def _enrich_and_build_response(
+    raw_result: dict,
+    citation_cache: dict[str, dict],
+) -> dict:
+    """
+    Take the agent's raw response (suggestion + raw_urls) and enrich
+    the URLs into structured citation objects using the session cache.
+    """
+    suggestion = raw_result.get("suggestion", "")
+    raw_urls = raw_result.get("raw_urls", [])
+
+    if not raw_urls:
+        return {"suggestion": suggestion, "citations": []}
+
+    # Enrich raw URLs into structured citation metadata
+    enriched_citations = await enrich_citations(raw_urls, citation_cache)
+
+    return {"suggestion": suggestion, "citations": enriched_citations}
 
 
 async def get_suggestion_with_research(
@@ -372,12 +393,17 @@ async def get_suggestion_with_research(
     title: str,
     heading: str,
     content: str,
+    citation_cache: dict[str, dict] | None = None,
 ) -> dict:
     """
     FIRST-CALL path: Full research pipeline.
     Searches the web, scrapes pages, stores in Qdrant, queries, then suggests.
+    Returns structured citation metadata objects.
     Takes ~15-30 seconds.
     """
+    if citation_cache is None:
+        citation_cache = {}
+
     agent = get_research_agent()
     collection_name = f"doc_{document_id}"
     ensure_collection(collection_name)
@@ -404,7 +430,8 @@ Please search the web for relevant information about this topic, scrape the most
 
     try:
         result = await agent.ainvoke(initial_state, config={"recursion_limit": 100000})
-        return _parse_agent_response(result)
+        raw_result = _parse_agent_raw_response(result)
+        return await _enrich_and_build_response(raw_result, citation_cache)
     except Exception as e:
         logger.error(f"Research agent error: {e}", exc_info=True)
         return {"suggestion": f"Error generating suggestion: {str(e)}", "citations": []}
@@ -415,11 +442,16 @@ async def get_suggestion_fast(
     title: str,
     heading: str,
     content: str,
+    citation_cache: dict[str, dict] | None = None,
 ) -> dict:
     """
     FAST path: Only queries the existing Qdrant knowledge base and generates a suggestion.
+    Returns structured citation metadata objects. Cached URLs resolve instantly.
     Takes ~2-4 seconds.
     """
+    if citation_cache is None:
+        citation_cache = {}
+
     agent = get_fast_agent()
     collection_name = f"doc_{document_id}"
 
@@ -445,7 +477,8 @@ The knowledge base (collection: "{collection_name}") already contains researched
 
     try:
         result = await agent.ainvoke(initial_state, config={"recursion_limit": 100000})
-        return _parse_agent_response(result)
+        raw_result = _parse_agent_raw_response(result)
+        return await _enrich_and_build_response(raw_result, citation_cache)
     except Exception as e:
         logger.error(f"Fast agent error: {e}", exc_info=True)
         return {"suggestion": f"Error generating suggestion: {str(e)}", "citations": []}

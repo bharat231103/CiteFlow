@@ -56,6 +56,10 @@ active_sessions: dict[str, WebSocket] = {}
 # (their Qdrant collection is populated and ready for fast queries)
 initialized_sessions: set[str] = set()
 
+# Per-session citation metadata cache: doc_id → {url → structured_citation}
+# Avoids re-enriching URLs that were already resolved during the research path
+citation_caches: dict[str, dict[str, dict]] = {}
+
 
 # ─── Lifespan ────────────────────────────────────────────────────────────────
 
@@ -87,6 +91,7 @@ async def lifespan(app: FastAPI):
         _cleanup_session(doc_id)
     active_sessions.clear()
     initialized_sessions.clear()
+    citation_caches.clear()
 
 
 def _cleanup_session(doc_id: str):
@@ -166,6 +171,7 @@ async def suggest_websocket(websocket: WebSocket, document_id: str):
     """
     await websocket.accept()
     active_sessions[document_id] = websocket
+    citation_caches[document_id] = {}  # Fresh citation cache for this session
 
     logger.info(f"🔌 WebSocket connected: document_id={document_id}")
 
@@ -217,12 +223,15 @@ async def suggest_websocket(websocket: WebSocket, document_id: str):
 
             # ── Process ──────────────────────────────────────────────────
             try:
+                session_cache = citation_caches.get(document_id, {})
+
                 if is_first_call:
                     result = await get_suggestion_with_research(
                         document_id=document_id,
                         title=title,
                         heading=heading,
                         content=content,
+                        citation_cache=session_cache,
                     )
                     # Mark this doc_id as initialized
                     initialized_sessions.add(document_id)
@@ -233,6 +242,7 @@ async def suggest_websocket(websocket: WebSocket, document_id: str):
                         title=title,
                         heading=heading,
                         content=content,
+                        citation_cache=session_cache,
                     )
 
                 # Send the suggestion
@@ -260,6 +270,7 @@ async def suggest_websocket(websocket: WebSocket, document_id: str):
         # ── Cleanup on disconnect ────────────────────────────────────────
         active_sessions.pop(document_id, None)
         initialized_sessions.discard(document_id)
+        citation_caches.pop(document_id, None)
         _cleanup_session(document_id)
         logger.info(f"🧹 Session fully cleaned up for doc={document_id}")
 
